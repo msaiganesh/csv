@@ -1,0 +1,112 @@
+public class ApiCsvPagingItemReader<T> extends AbstractItemStreamItemReader<T> {
+    private int currentPage = 1;
+    private Iterator<T> currentIterator;
+    private final int pageSize = 1_000_000;
+    private boolean noMoreData = false;
+    private final ApiCsvRowMapper<T> rowMapper;
+
+    public ApiCsvPagingItemReader(ApiCsvRowMapper<T> rowMapper) {
+        this.rowMapper = rowMapper;
+    }
+
+    @Override
+    public T read() throws Exception {
+        if (noMoreData) return null;
+        if (currentIterator == null || !currentIterator.hasNext()) {
+            // Fetch next page as stream
+            InputStream csvStream = getCsvDataFromApi(currentPage++);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(csvStream));
+            currentIterator = reader.lines()
+                .skip(1) // skip header, if present
+                .map(line -> rowMapper.map(line.split(",")))
+                .iterator();
+            if (!currentIterator.hasNext()) {
+                noMoreData = true;
+                return null;
+            }
+        }
+        return currentIterator.next();
+    }
+
+    private InputStream getCsvDataFromApi(int page) throws IOException {
+        // Implement HTTP GET API call with pagination (e.g., ?page=1)
+        // and return response input stream
+        // Use a library like HttpClient/RestTemplate
+    }
+}
+
+
+
+@Configuration
+@EnableBatchProcessing
+public class BatchConfig {
+    @Autowired DataSource dataSource;
+
+    @Bean
+    public Job importJob(JobBuilderFactory jobs, Step importStep) {
+        return jobs.get("importJob").flow(importStep).end().build();
+    }
+
+    @Bean
+    public Step importStep(StepBuilderFactory steps) {
+        return steps.get("importStep")
+            .<ModelType, ModelType>chunk(10_000)
+            .reader(apiCsvPagingItemReader())
+            .writer(jdbcBatchItemWriter())
+            .taskExecutor(new SimpleAsyncTaskExecutor()) // Parallelize chunk processing
+            .build();
+    }
+
+    @Bean
+    public ItemReader<ModelType> apiCsvPagingItemReader() {
+        return new ApiCsvPagingItemReader<>(new YourModelRowMapper());
+    }
+
+    @Bean
+    public JdbcBatchItemWriter<ModelType> jdbcBatchItemWriter() {
+        JdbcBatchItemWriter<ModelType> writer = new JdbcBatchItemWriter<>();
+        writer.setDataSource(dataSource);
+        writer.setSql("INSERT INTO your_table (col1, col2, ...) VALUES (?, ?, ...)");
+        writer.setItemPreparedStatementSetter(new YourPreparedStatementSetter());
+        return writer;
+    }
+}
+
+
+
+@Configuration
+@EnableBatchProcessing
+public class BatchConfig {
+    @Autowired DataSource dataSource;
+
+    @Bean
+    public Job importJob(JobBuilderFactory jobs, Step importStep) {
+        return jobs.get("importJob").flow(importStep).end().build();
+    }
+
+    @Bean
+    public Step importStep(StepBuilderFactory steps) {
+        return steps.get("importStep")
+            .<ModelType, ModelType>chunk(10_000)
+            .reader(apiCsvPagingItemReader())
+            .writer(jdbcBatchItemWriter())
+            .taskExecutor(new SimpleAsyncTaskExecutor()) // Parallelize chunk processing
+            .build();
+    }
+
+    @Bean
+    public ItemReader<ModelType> apiCsvPagingItemReader() {
+        return new ApiCsvPagingItemReader<>(new YourModelRowMapper());
+    }
+
+    @Bean
+    public JdbcBatchItemWriter<ModelType> jdbcBatchItemWriter() {
+        JdbcBatchItemWriter<ModelType> writer = new JdbcBatchItemWriter<>();
+        writer.setDataSource(dataSource);
+        writer.setSql("INSERT INTO your_table (col1, col2, ...) VALUES (?, ?, ...)");
+        writer.setItemPreparedStatementSetter(new YourPreparedStatementSetter());
+        return writer;
+    }
+}
+
+
