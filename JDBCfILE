@@ -1,0 +1,226 @@
+package com.example.batch;
+
+import org.springframework.batch.core.*;
+import org.springframework.batch.core.configuration.annotation.*;
+import org.springframework.batch.core.partition.support.Partitioner;
+import org.springframework.batch.core.partition.support.SimplePartitioner;
+import org.springframework.batch.core.scope.context.ChunkContext;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.item.*;
+import org.springframework.batch.item.database.*;
+import org.springframework.batch.item.database.support.SqlPagingQueryProviderFactoryBean;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.*;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.jdbc.core.*;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import javax.sql.DataSource;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Configuration
+@EnableBatchProcessing
+public class ParallelEcidBatchConfig {
+
+    // --- === POJO mapping the materialized view record === ---
+    public static class EcidAggregate {
+        public String ecid;
+        public String clientField1;
+        public String clientField2;
+        public String coverageListJson; // JSON aggregated coverage data
+
+        // getters/setters or public fields for brevity
+    }
+
+    // --- === RowMapper to map ResultSet row to POJO === ---
+    static class EcidAggregateRowMapper implements RowMapper<EcidAggregate> {
+        @Override
+        public EcidAggregate mapRow(ResultSet rs, int rowNum) throws SQLException {
+            EcidAggregate ea = new EcidAggregate();
+            ea.ecid = rs.getString("ecid");
+            ea.clientField1 = rs.getString("client_field_1");
+            ea.clientField2 = rs.getString("client_field_2");
+            ea.coverageListJson = rs.getString("coverage_list");
+            return ea;
+        }
+    }
+
+    // === Tasklet to create or refresh materialized view ===
+    static class MaterializedViewTasklet implements Tasklet {
+        private final JdbcTemplate jdbcTemplate;
+        MaterializedViewTasklet(JdbcTemplate jdbcTemplate) {
+            this.jdbcTemplate = jdbcTemplate;
+        }
+
+        @Override
+        public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+            jdbcTemplate.execute("DROP MATERIALIZED VIEW IF EXISTS ecid_aggregated_view");
+            jdbcTemplate.execute("""
+                CREATE MATERIALIZED VIEW ecid_aggregated_view AS
+                SELECT
+                    c.ecid,
+                    c.client_field_1,
+                    c.client_field_2,
+                    CAST(c.ecid AS BIGINT) as ecid_numeric, -- Assuming ecid can cast to BIGINT for partitioning
+                    json_agg(
+                        json_build_object(
+                            'coverage_field_1', cov.coverage_field_1,
+                            'coverage_field_2', cov.coverage_field_2
+                        )
+                    ) AS coverage_list
+                FROM client_staging_iq c
+                LEFT JOIN coverage_staging_iq cov ON c.ecid = cov.ecid
+                GROUP BY c.ecid, c.client_field_1, c.client_field_2
+                """);
+            return RepeatStatus.FINISHED;
+        }
+    }
+
+    // === Partitioner splits data range ecid_numeric between min and max into partitions ===
+    static class EcidRangePartitioner implements Partitioner {
+
+        private final JdbcTemplate jdbcTemplate;
+
+        EcidRangePartitioner(JdbcTemplate jdbcTemplate) {
+            this.jdbcTemplate = jdbcTemplate;
+        }
+
+        @Override
+        public Map<String, ExecutionContext> partition(int gridSize) {
+            Long minId = jdbcTemplate.queryForObject("SELECT MIN(ecid_numeric) FROM ecid_aggregated_view", Long.class);
+            Long maxId = jdbcTemplate.queryForObject("SELECT MAX(ecid_numeric) FROM ecid_aggregated_view", Long.class);
+
+            long targetSize = (maxId - minId) / gridSize + 1;
+
+            Map<String, ExecutionContext> partitions = new HashMap<>();
+
+            long start = minId;
+            long end = start + targetSize - 1;
+
+            for (int i = 0; i < gridSize; i++) {
+                ExecutionContext context = new ExecutionContext();
+                if (end >= maxId) end = maxId;
+
+                context.putLong("minId", start);
+                context.putLong("maxId", end);
+                partitions.put("partition" + i, context);
+
+                start = end + 1;
+                end += targetSize;
+            }
+
+            return partitions;
+        }
+    }
+
+    @Autowired
+    private DataSource dataSource;
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public JdbcTemplate jdbcTemplate() {
+        return new JdbcTemplate(dataSource);
+    }
+
+    // === Step 1: Tasklet to create/refresh materialized view ===
+    @Bean
+    public Step materializedViewStep() {
+        return stepBuilderFactory.get("materializedViewStep")
+                .tasklet(new MaterializedViewTasklet(jdbcTemplate()))
+                .build();
+    }
+
+    // === Reader for worker step (reads partitioned slice) ===
+    @Bean
+    @StepScope
+    public JdbcPagingItemReader<EcidAggregate> ecidAggregateReader(@Value("#{stepExecutionContext['minId']}") Long minId,
+                                                                  @Value("#{stepExecutionContext['maxId']}") Long maxId) throws Exception {
+        JdbcPagingItemReader<EcidAggregate> reader = new JdbcPagingItemReader<>();
+        reader.setDataSource(dataSource);
+        reader.setPageSize(5000);
+
+        SqlPagingQueryProviderFactoryBean queryProvider = new SqlPagingQueryProviderFactoryBean();
+        queryProvider.setDataSource(dataSource);
+        queryProvider.setSelectClause("SELECT ecid, client_field_1, client_field_2, coverage_list");
+        queryProvider.setFromClause("FROM ecid_aggregated_view");
+        queryProvider.setWhereClause("ecid_numeric BETWEEN :minId AND :maxId");
+        queryProvider.setSortKey("ecid_numeric");
+        reader.setQueryProvider(queryProvider.getObject());
+
+        // Set parameter values for :minId and :maxId
+        reader.setParameterValues(Map.of("minId", minId, "maxId", maxId));
+        reader.setRowMapper(new EcidAggregateRowMapper());
+
+        return reader;
+    }
+
+    // === Simple processor (identity) ===
+    @Bean
+    @StepScope
+    public ItemProcessor<EcidAggregate, EcidAggregate> processor() {
+        return item -> item; // replace with your transformation logic if needed
+    }
+
+    // === Writer: Pseudo Elasticsearch bulk writer. Replace with your ES client ===
+    @Bean
+    @StepScope
+    public ItemWriter<EcidAggregate> esBulkWriter() {
+        return items -> {
+            // TODO: Call your ES bulk indexing client here with 'items'
+            System.out.println("Writing batch of " + items.size() + " items to Elasticsearch");
+            // e.g. esClient.bulkIndex(items);
+        };
+    }
+
+    // === Worker Step processing one partition slice ===
+    @Bean
+    public Step workerStep() throws Exception {
+        return stepBuilderFactory.get("workerStep")
+                .<EcidAggregate, EcidAggregate>chunk(5000)
+                .reader(ecidAggregateReader(null, null)) // Spring will inject stepExecutionContext values
+                .processor(processor())
+                .writer(esBulkWriter())
+                .build();
+    }
+
+    // === Partitioned step running multiple workerStep instances in parallel ===
+    @Bean
+    public Step partitionedStep(TaskExecutor taskExecutor) throws Exception {
+        return stepBuilderFactory.get("partitionedStep")
+                .partitioner(workerStep().getName(), new EcidRangePartitioner(jdbcTemplate()))
+                .step(workerStep())
+                .taskExecutor(taskExecutor)
+                .gridSize(10) // Number of partitions/threads - tune as needed
+                .build();
+    }
+
+    // === TaskExecutor for parallel steps ===
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("partition-thread-");
+        executor.initialize();
+        return executor;
+    }
+
+    // === Job Definition: materialized view creation -> partitioned processing ===
+    @Bean
+    public Job ecidParallelJob() throws Exception {
+        return jobBuilderFactory.get("ecidParallelJob")
+                .start(materializedViewStep())
+                .next(partitionedStep(taskExecutor()))
+                .build();
+    }
+}
